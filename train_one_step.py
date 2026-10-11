@@ -716,7 +716,6 @@ def main(args):
     else:
         _load_safetensors_into(model.video_controlnet, args.pretrained_model_path, "ControlNet")
         _load_safetensors_into(model.unet, args.unet_checkpoint, "UNet")
-    model.controlnet_vi.load_state_dict(model.video_controlnet.state_dict())
 
     replace_vae_to_4x(model, args.vae_4x_ckpt)
     # 显式再次冻结，避免替换 VAE 后出现 requires_grad 漂移。
@@ -726,10 +725,6 @@ def main(args):
     # UNet 和红外 ControlNet 全量训练。可见光已经在 x_t 里，不训练第二条 ControlNet。
     # VAE、RAFT 冻结。
     model.freeze_for_training(train_controlnet=True, train_unet=True, train_hfp_only=False)
-    for param in model.controlnet_vi.parameters():
-        param.requires_grad = False
-    model.controlnet_vi.eval()
-    model.controlnet_vi.cpu()
     model.train_mode()
     if model.ir_flow_prop is not None:
         model.ir_flow_prop.eval()

@@ -1,25 +1,12 @@
 """
-Video ControlNet Model with Flow Matching (VI → Fusion)
+Visible-conditioned latent diffusion for asynchronous VI–IR fusion.
 
-架构 (策略 B — warp 在 ControlNet 之后):
-- VI视频 (4帧) → VAE编码 → vi_latent (起点)
-- GT视频 (4帧) → VAE编码 → gt_latent (终点)
-- IR红外 (1帧→复制4帧, 静态) → VAE编码 → ir_latent → ControlNet (hint) → 控制信号
-- VI像素帧 → RAFT → 帧间光流 → 累积光流 → warp 控制信号 (多尺度)
-- 轨迹: velocity = gt_latent - vi_latent
-- 插值: x_t = (1-t) * vi_latent + t * gt_latent
-- 模型预测 velocity → Loss = MSE(pred_velocity, velocity)
-
-策略 B 核心:
-- ControlNet 始终接收静态 IR (4帧相同)，输入分布与 Fusion4 一致，无需解冻
-- warp 发生在 ControlNet 输出之后、注入 UNet 之前
-- UNet 空间模块学习吸收运动对齐的 skip connection
-
-训练策略:
-- ControlNet: ❄️ 冻结 (输入分布不变)
-- UNet 时序模块: ❄️ 冻结 (保留预训练时序知识)
-- UNet 空间模块 + HFP: 🔥 可训练
-- VAE / RAFT: ❄️ 始终冻结
+扩散状态是带噪的可见光 latent：
+  x_t = sqrt(ᾱ_t) z_VI + sqrt(1-ᾱ_t) ε
+主 UNet 直接预测融合 latent z_F。
+红外是唯一的 ControlNet 条件；控制残差在注入 UNet 前用 RAFT 光流对齐。
+可见光已经包含在 x_t 里，不再另建 VI ControlNet。
+VAE 与 RAFT 冻结。
 """
 
 import os
@@ -86,12 +73,9 @@ class VideoControlNetModel:
         self.device = device
         self.use_hfp = use_hfp
         
-        # ============ 双条件分支 ============
-        # video_controlnet: IR 条件。controlnet_vi: VI 条件。
-        # 两者结构相同，残差相加后注入主 UNet。
+        # 红外条件分支。可见光已经在带噪的 x_t 里，不再建第二条 ControlNet。
         self.video_controlnet = VideoControlNet().to(self.device)
-        self.controlnet_vi = VideoControlNet().to(self.device)
-        logger.info('Built IR ControlNet and VI ControlNet')
+        logger.info('Built IR ControlNet')
         
         # ============ Vid2VidSDUNet (或 SGFEVid2VidSDUNet) ============
         if use_hfp:
@@ -132,7 +116,7 @@ class VideoControlNetModel:
             solver="euler",
             device=self.device
         )
-        logger.info('Built Flow Matching Scheduler (VI → Fusion)')
+        logger.info('Built legacy discrete scheduler')
 
         # 扩散状态是带噪的可见光 latent。网络直接预测融合 latent x0。
         from diffusers import DDPMScheduler, DDIMScheduler
@@ -218,9 +202,6 @@ class VideoControlNetModel:
             
             ret1 = self.video_controlnet.load_state_dict(ctrl_dict, strict=False)
             ret2 = self.unet.load_state_dict(unet_dict, strict=False)
-            if hasattr(self, "controlnet_vi"):
-                ret3 = self.controlnet_vi.load_state_dict(ctrl_dict, strict=False)
-                logger.info(f'Loaded VI ControlNet from the same checkpoint: missing={len(ret3.missing_keys)}')
             
             logger.info(f'Loaded IR ControlNet: missing={len(ret1.missing_keys)}')
             logger.info(f'Loaded UNet: missing={len(ret2.missing_keys)}')
@@ -263,7 +244,7 @@ class VideoControlNetModel:
                 for param in ctrl.parameters():
                     param.requires_grad = train_controlnet
             status_ctrl = "可训练" if train_controlnet else "冻结"
-            print(f"ControlNet-IR / ControlNet-VI: {status_ctrl}")
+            print(f"IR ControlNet: {status_ctrl}")
 
             for param in self.unet.parameters():
                 param.requires_grad = train_unet
@@ -295,10 +276,7 @@ class VideoControlNetModel:
         print("VAE: 冻结")
     
     def _controlnets(self):
-        nets = [self.video_controlnet]
-        if getattr(self, "controlnet_vi", None) is not None:
-            nets.append(self.controlnet_vi)
-        return nets
+        return [self.video_controlnet]
 
     def get_trainable_parameters(self):
         """返回所有可训练参数 (两路 ControlNet + UNet，含 HFP)"""
@@ -416,14 +394,13 @@ class VideoControlNetModel:
                 vi_frames=None, _precomputed_flows=None,
                 ir_anchor_idx: int = 0, **kwargs):
         """
-        前向传播 (Flow Matching: VI → Fusion, 策略 B, 支持 anchor 在中间帧)
+        旧的单分支前向，保留给尚未改到 forward_diffusion 的脚本。
+        当前训练请用 forward_diffusion：输入是带噪可见光 latent，输出是融合 latent。
 
-        策略 B 数据流:
+        数据流:
           1. ControlNet 接收静态 IR latent → 多尺度 skip connections
-             (8 帧 skip 中 IR 信息空间位置都在 VI[ir_anchor_idx] 的位置)
-          2. RAFT 估计 VI 帧间双向光流
-          3. 以 ir_anchor_idx 为锚点, 双向累积光流 warp 每个 skip → 空间对齐
-          4. UNet 接收对齐后的 skip → 预测 velocity
+          2. RAFT 估计 VI 帧间光流，并把红外控制残差对齐到各帧
+          3. UNet 接收对齐后的 skip，输出与 x_t 同形状的 latent
 
         Args:
             x_t          : (B, C, T, H/s, W/s) 当前插值状态
@@ -872,7 +849,7 @@ class VideoControlNetModel:
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Video ControlNet Model 测试 (Flow Matching: VI → Fusion)")
+    print("Visible-conditioned latent diffusion")
     print("=" * 70)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
