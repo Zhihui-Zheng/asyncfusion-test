@@ -21,6 +21,11 @@ Thumbs.db
 **/checkpoint-*/
 **/checkpoints/
 
+# 这份融合代码不依赖的第三方副本
+Cinemo/
+TemCoCo/
+train_util/dpo/
+
 # 生成结果、演示素材
 vae_test_output/
 train_stage2/
