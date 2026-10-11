@@ -762,49 +762,18 @@ class VideoControlNetModel:
             x = self.ddim_step_from_x0(x, t_value, t_prev, z0_pred)
         return x
 
-    # ============ Flow Matching 采样 (从 VI 开始) ============
-    
     @torch.no_grad()
     def sample(self, vi_latent, ir_latent, num_steps=20, time_shift=13.0,
-               vi_frames=None, ir_anchor_idx: int = 0):
-        """
-        Flow Matching 采样 (从 vi_latent 开始积分, 支持双向 warp)
-
-        Args:
-            vi_latent    : (B, C, T, H/s, W/s) VI latent (起点)
-            ir_latent    : (B, C, T, H/s, W/s) IR latent (ControlNet hint)
-            num_steps    : 采样步数
-            time_shift   : 时间偏移参数
-            vi_frames    : (B, T, 3, H_pix, W_pix) VI 像素帧, [-1, 1]
-            ir_anchor_idx: int, IR 锚点 0-indexed 位置 (默认 0 兼容旧推理)
-
-        Returns:
-            x: (B, C, T, H/s, W/s) 融合后的 latent
-        """
-        B, C, T, H, W = vi_latent.shape
-        device = vi_latent.device
-
-        self.noise_scheduler.set_timesteps(num_steps, time_shift=time_shift, device=device)
-
-        # 预计算光流, 采样循环中复用. anchor 在中间帧 → 必须双向
-        precomputed_flows = None
-        if self.ir_flow_prop is not None and vi_frames is not None:
-            if ir_anchor_idx > 0:
-                precomputed_flows = self.ir_flow_prop.estimate_bidirectional_flows(vi_frames)
-            else:
-                precomputed_flows = self.ir_flow_prop.estimate_flow(vi_frames)
-
-        x = vi_latent.clone()
-
-        for t in self.noise_scheduler.timesteps:
-            t_batch = t.unsqueeze(0).repeat(B)
-            v_pred = self.forward(x, t_batch, ir_latent,
-                                  vi_frames=vi_frames,
-                                  _precomputed_flows=precomputed_flows,
-                                  ir_anchor_idx=int(ir_anchor_idx))
-            x = self.noise_scheduler.step(v_pred, t, x)
-
-        return x
+               vi_frames=None, ir_anchor_idx: int = 0, strength: float = 1.0):
+        """从带噪可见光 latent 做 x0-DDIM。time_shift 已不再使用。"""
+        del time_shift
+        return self.sample_diffusion(
+            vi_latent, ir_latent,
+            num_steps=num_steps,
+            vi_frames=vi_frames,
+            ir_anchor_idx=ir_anchor_idx,
+            strength=strength,
+        )
     
     # ============ 推理接口 ============
     
