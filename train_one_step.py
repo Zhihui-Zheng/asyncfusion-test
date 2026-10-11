@@ -1,15 +1,12 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-训练脚本 — Fusion_SGFE 单步无监督（block3 版 SGFE）
+训练脚本 — VI-conditioned image-to-image latent diffusion
 
-当前设置:
-  - 使用 SGFE（use_hfp=True），SGFE 初始化为 zeros（block3 全0）
-  - 打开空间/时间 local（use_spa_local=True, use_temp_local=True）
-  - 开启 IR 光流传播（raft_model_path）
-  - 冻结扩散模型（ControlNet + UNet + VAE）
-  - 单步扩散积分 + VAE 解码后接 TemporalRestormer（内置 3D 时序卷积、恒等初始化）
-  - 在最终增强图像上做无监督损失（SSIM/Max/Color/Grad）
+训练和推理使用同一个前向过程：
+  x_t = sqrt(ᾱ_t) z_VI + sqrt(1-ᾱ_t) ε
+网络直接预测融合 latent z_F。红外是唯一的 ControlNet 条件，残差用光流对齐。
+VAE 和 RAFT 冻结。UNet 与红外 ControlNet 全量训练。这一阶段不接 TemporalRestormer。
 """
 
 import os
@@ -33,15 +30,17 @@ from einops import rearrange
 from tqdm.auto import tqdm
 
 import sys
-base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(base_path)
+this_dir = os.path.dirname(os.path.abspath(__file__))
+base_path = os.path.abspath(os.path.join(this_dir, '..'))
+sys.path.insert(0, base_path)
+sys.path.insert(0, this_dir)
 
-from Fusion_SGFE.dual_modal_fusion_model import VideoControlNetModel
-from Fusion_SGFE.train_latent_vae48_tem import replace_vae_to_4x
+from dual_modal_fusion_model import VideoControlNetModel
+from train_latent_vae48_tem import replace_vae_to_4x
 
 logger = get_logger(__name__)
 
-# 单步无监督默认损失比例（固定，不做调参入口）
+# 融合辅助损失的内部比例（固定，不做调参入口）
 LOSS_MAX_RATIO = 4.0
 LOSS_SSIM_RATIO = 1.0
 LOSS_SSIM_VIS_RATIO = 1.0
@@ -134,9 +133,11 @@ class SlidingRatioVideoDataset(torch.utils.data.Dataset):
         self, vi_dir, ir_dir,
         num_frames=8, window_stride=2, vi_per_ir=8,
         video_size=(256, 256), ir_select_mode="start", ir_middle_local_idx=None,
+        gt_dir=None,
     ):
         self.vi_dir = Path(vi_dir)
         self.ir_dir = Path(ir_dir)
+        self.gt_dir = None if gt_dir is None else Path(gt_dir)
         self.num_frames = int(num_frames)
         self.window_stride = int(max(1, window_stride))
         self.vi_per_ir = int(max(1, vi_per_ir))
@@ -149,10 +150,23 @@ class SlidingRatioVideoDataset(torch.utils.data.Dataset):
         print(
             f"SlidingRatioVideoDataset: {len(self.samples)} clips, "
             f"ir_select_mode={self.ir_select_mode}, "
-            f"video_size={self.video_size}"
+            f"video_size={self.video_size}, gt={'on' if self.gt_dir is not None else 'off'}"
         )
 
+    def _window_starts(self, length):
+        if length < self.num_frames:
+            return []
+        if self.window_stride >= self.num_frames:
+            starts = list(range(0, length - self.num_frames + 1, self.num_frames))
+        else:
+            starts = list(range(0, length - self.num_frames + 1, self.window_stride))
+            if starts and starts[-1] != length - self.num_frames:
+                starts.append(length - self.num_frames)
+        return starts
+
     def _collect_samples(self):
+        if self.gt_dir is not None:
+            return self._collect_samples_with_gt()
         samples = []
         if not (self.vi_dir.exists() and self.ir_dir.exists()):
             return samples
@@ -177,18 +191,59 @@ class SlidingRatioVideoDataset(torch.utils.data.Dataset):
                 continue
 
             vi_seq = vi_files
-
-            if self.window_stride >= self.num_frames:
-                starts = list(range(0, len(vi_seq) - self.num_frames + 1, self.num_frames))
-            else:
-                starts = list(range(0, len(vi_seq) - self.num_frames + 1, self.window_stride))
-                if starts and starts[-1] != len(vi_seq) - self.num_frames:
-                    starts.append(len(vi_seq) - self.num_frames)
+            starts = self._window_starts(len(vi_seq))
             if not starts:
                 continue
 
             samples.append({
                 "vi_seq": vi_seq,
+                "ir_seq": ir_files,
+                "starts": starts,
+            })
+        return samples
+
+    def _collect_samples_with_gt(self):
+        samples = []
+        if not (self.vi_dir.exists() and self.ir_dir.exists() and self.gt_dir.exists()):
+            return samples
+
+        gt_subdirs = [d for d in sorted(self.gt_dir.iterdir()) if d.is_dir()]
+        if gt_subdirs:
+            triples = []
+            for gt_sub in gt_subdirs:
+                vi_sub = self.vi_dir / gt_sub.name
+                ir_sub = self.ir_dir / gt_sub.name
+                if vi_sub.is_dir() and ir_sub.is_dir():
+                    triples.append((vi_sub, ir_sub, gt_sub))
+        else:
+            triples = [(self.vi_dir, self.ir_dir, self.gt_dir)]
+
+        for vi_sub, ir_sub, gt_sub in triples:
+            vi_files = sorted(list(vi_sub.glob("*.png")) + list(vi_sub.glob("*.jpg")))
+            gt_files = sorted(list(gt_sub.glob("*.png")) + list(gt_sub.glob("*.jpg")))
+            ir_files = sorted(list(ir_sub.glob("*.png")) + list(ir_sub.glob("*.jpg")))
+            if len(vi_files) < self.num_frames or len(gt_files) < self.num_frames or len(ir_files) == 0:
+                continue
+
+            vi_map = {f.stem: f for f in vi_files}
+            gt_map = {f.stem: f for f in gt_files}
+            common = sorted(set(vi_map) & set(gt_map))
+            if len(common) >= self.num_frames:
+                vi_seq = [vi_map[s] for s in common]
+                gt_seq = [gt_map[s] for s in common]
+            else:
+                n = min(len(vi_files), len(gt_files))
+                if n < self.num_frames:
+                    continue
+                vi_seq = vi_files[:n]
+                gt_seq = gt_files[:n]
+
+            starts = self._window_starts(len(vi_seq))
+            if not starts:
+                continue
+            samples.append({
+                "vi_seq": vi_seq,
+                "gt_seq": gt_seq,
                 "ir_seq": ir_files,
                 "starts": starts,
             })
@@ -204,6 +259,8 @@ class SlidingRatioVideoDataset(torch.utils.data.Dataset):
             "ir_video": torch.randn(3, self.num_frames, *self.video_size),
             "ir_anchor_idx": torch.tensor(int(dummy_anchor), dtype=torch.long),
         }
+        if self.gt_dir is not None:
+            dummy["gt_video"] = torch.randn(3, self.num_frames, *self.video_size)
         if not self.samples:
             return dummy
 
@@ -213,6 +270,10 @@ class SlidingRatioVideoDataset(torch.utils.data.Dataset):
 
         vi_frames = [_load_image_as_gray3(sample["vi_seq"][i], self.video_size) for i in indices]
         vi_video = torch.from_numpy(np.transpose(np.stack(vi_frames), (3, 0, 1, 2))).float()
+        gt_video = None
+        if "gt_seq" in sample:
+            gt_frames = [_load_image_as_gray3(sample["gt_seq"][i], self.video_size) for i in indices]
+            gt_video = torch.from_numpy(np.transpose(np.stack(gt_frames), (3, 0, 1, 2))).float()
 
         vi_window = [sample["vi_seq"][i] for i in indices]
         ir_idx, ir_local_idx = _select_ir_index_for_vi_window(
@@ -227,11 +288,14 @@ class SlidingRatioVideoDataset(torch.utils.data.Dataset):
         ir_frame = torch.from_numpy(np.transpose(ir_frame, (2, 0, 1))).float()
         ir_video = ir_frame.unsqueeze(1).repeat(1, self.num_frames, 1, 1)
 
-        return {
+        item = {
             "vi_video": vi_video,
             "ir_video": ir_video,
             "ir_anchor_idx": torch.tensor(int(ir_local_idx), dtype=torch.long),
         }
+        if gt_video is not None:
+            item["gt_video"] = gt_video
+        return item
 
 
 def _load_safetensors_into(module, path, name):
@@ -474,6 +538,14 @@ def save_validation_triplet(vi_video, ir_video, pred_video, save_dir, step):
     cv2.imwrite(os.path.join(save_dir, f"step_{step:06d}.png"), (np.clip(grid, 0, 1) * 255.0).astype(np.uint8))
 
 
+def decode_video(model, latent, num_frames):
+    """VAE 解码到 [0,1]。保留梯度，让融合损失能回到噪声预测。"""
+    batch = latent.shape[0]
+    video = model.vae_decode_chunk(latent, chunk_size=num_frames)
+    video = rearrange(video, "(b t) c h w -> b c t h w", b=batch, t=num_frames)
+    return torch.clamp((video + 1.0) * 0.5, 0.0, 1.0)
+
+
 def decode_and_enhance(model, sr_module, latent, num_frames):
     """统一的重建尾部：VAE 解码(冻结) + TemporalRestormer 增强。
 
@@ -536,22 +608,35 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         "--vae_4x_ckpt", type=str,
-        default=r"pretrained_weight/vae_4x_tvt.ckpt",
+        default=os.path.join(base_path, "pretrained_weight", "vae_4x_tvt.ckpt"),
     )
     parser.add_argument(
         "--raft_model_path", type=str,
-        default=r"Fusion_SGFE/ProPainter/weights/raft-things.pth",
+        default=os.path.join(this_dir, "ProPainter", "weights", "raft-things.pth"),
     )
 
     # 数据
     parser.add_argument(
         "--vi_data_dir", type=str,
-        default=r"E:\paper2\codebase\STAR\Fusion\dataset\train\LLVIP\visible2",
+        default=r"E:\paper2\codebase\STAR\Fusion\dataset\train\M3SVD\visible1",
     )
     parser.add_argument(
         "--ir_data_dir", type=str,
-        default=r"E:\paper2\codebase\STAR\Fusion\dataset\train\LLVIP\infrared",
+        default=r"E:\paper2\codebase\STAR\Fusion\dataset\train\M3SVD\infrared",
     )
+    parser.add_argument(
+        "--gt_data_dir", type=str,
+        default=r"E:\paper2\codebase\STAR\Fusion\dataset\train\M3SVD\Fusion",
+        help="GT fusion 图像目录，编码后作为被加噪的扩散变量",
+    )
+    parser.add_argument("--num_train_timesteps", type=int, default=1000)
+    parser.add_argument("--num_inference_steps", type=int, default=20,
+                        help="验证时的 DDIM 步数")
+    parser.add_argument("--denoise_strength", type=float, default=1.0,
+                        help="推理起始噪声比例。1 从最吵的一步开始，和训练的前向过程一致")
+    parser.add_argument("--lambda_int", type=float, default=0.1)
+    parser.add_argument("--lambda_ssim", type=float, default=0.1)
+    parser.add_argument("--lambda_grad", type=float, default=0.1)
 
     # 训练
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -559,7 +644,7 @@ def parse_args(input_args=None):
     parser.add_argument("--max_train_steps", type=int, default=3000)
     parser.add_argument("--start_step", type=int, default=0)
     parser.add_argument("--num_frames", type=int, default=8)
-    parser.add_argument("--video_size", type=int, nargs=2, default=[512, 512])
+    parser.add_argument("--video_size", type=int, nargs=2, default=[128, 128])
     parser.add_argument("--window_stride", type=int, default=8, help="训练窗口步长；默认8表示非重叠分组，<8为滑动")
     parser.add_argument("--vi_per_ir", type=int, default=8)
     parser.add_argument("--ir_select_mode", type=str, default="start",
@@ -604,7 +689,7 @@ def main(args):
 
     class _Opt:
         model_path = None
-        vae_path = "stabilityai/stable-video-diffusion-img2vid"
+        vae_path = None
 
     # 启用 SGFE(block3) + 打开 spa/temp local + 开启光流。
     model = VideoControlNetModel(
@@ -631,28 +716,28 @@ def main(args):
     else:
         _load_safetensors_into(model.video_controlnet, args.pretrained_model_path, "ControlNet")
         _load_safetensors_into(model.unet, args.unet_checkpoint, "UNet")
+    model.controlnet_vi.load_state_dict(model.video_controlnet.state_dict())
 
     replace_vae_to_4x(model, args.vae_4x_ckpt)
     # 显式再次冻结，避免替换 VAE 后出现 requires_grad 漂移。
     model.vae.eval()
     model.vae.requires_grad_(False)
 
-    # 按你的要求：扩散模型整体冻结，只训练后置 SR 适配器。
-    model.freeze_for_training(train_controlnet=False, train_unet=False, train_hfp_only=False)
-    model.eval_mode()
-
-    sr_adapter = build_temporal_restormer(scale=SR_UPSCALE).to(accelerator.device)
-    _load_sr_pretrained(sr_adapter, args.sr_pretrained_path)
+    # UNet 和红外 ControlNet 全量训练。可见光已经在 x_t 里，不训练第二条 ControlNet。
+    # VAE、RAFT 冻结。
+    model.freeze_for_training(train_controlnet=True, train_unet=True, train_hfp_only=False)
+    for param in model.controlnet_vi.parameters():
+        param.requires_grad = False
+    model.controlnet_vi.eval()
+    model.controlnet_vi.cpu()
+    model.train_mode()
+    if model.ir_flow_prop is not None:
+        model.ir_flow_prop.eval()
+        model.ir_flow_prop.requires_grad_(False)
 
     if accelerator.is_main_process:
         trainable_diffusion = sum(p.numel() for p in model.get_trainable_parameters())
-        trainable_sr = sum(p.numel() for p in sr_adapter.parameters() if p.requires_grad)
-        logger.info(
-            f"可训练参数: diffusion={trainable_diffusion / 1e6:.2f}M, "
-            f"sr_adapter={trainable_sr / 1e6:.2f}M"
-        )
-
-    noise_scheduler = model.noise_scheduler
+        logger.info(f"可训练参数: diffusion={trainable_diffusion / 1e6:.2f}M")
 
     dataset = SlidingRatioVideoDataset(
         args.vi_data_dir, args.ir_data_dir,
@@ -662,12 +747,15 @@ def main(args):
         video_size=tuple(args.video_size),
         ir_select_mode=args.ir_select_mode,
         ir_middle_local_idx=args.ir_middle_local_idx,
+        gt_dir=args.gt_data_dir,
     )
+    if len(dataset.samples) == 0:
+        raise RuntimeError(f"没有配上 VI/IR/GT 样本: {args.gt_data_dir}")
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=0,
     )
 
-    trainable_params = [p for p in sr_adapter.parameters() if p.requires_grad]
+    trainable_params = list(model.get_trainable_parameters())
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=1e-2)
 
     remaining_steps = args.max_train_steps - args.start_step
@@ -677,10 +765,13 @@ def main(args):
         num_training_steps=remaining_steps,
     )
 
-    sr_adapter, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        sr_adapter, optimizer, dataloader, lr_scheduler,
+    (
+        model.unet, model.video_controlnet,
+        optimizer, dataloader, lr_scheduler,
+    ) = accelerator.prepare(
+        model.unet, model.video_controlnet,
+        optimizer, dataloader, lr_scheduler,
     )
-    model.video_controlnet.half()
 
     if args.ir_select_mode == "middle":
         default_anchor_idx = (args.num_frames - 1) // 2 if args.ir_middle_local_idx is None \
@@ -701,14 +792,15 @@ def main(args):
         print(f"训练:       step {args.start_step} -> {args.max_train_steps}, "
               f"lr={args.learning_rate}, bs={args.train_batch_size}, frames={args.num_frames}")
         print(f"视频大小:   {args.video_size[0]}×{args.video_size[1]}，VI:IR = {args.vi_per_ir}:1")
-        print("冻结策略:   整个扩散模型冻结（ControlNet/UNet/VAE）")
-        print("训练对象:   仅 TemporalRestormer（内置3D时序，恒等初始化）")
-        print(f"SR预训练:   {args.sr_pretrained_path if args.sr_pretrained_path else '无（随机初始化）'}")
-        print(f"SR倍数:     x{SR_UPSCALE}")
-        print("Loss配置（无监督图像损失）:")
-        print(f"  max={LOSS_MAX_RATIO}, ssim={LOSS_SSIM_RATIO} "
-              f"(vis={LOSS_SSIM_VIS_RATIO}, ir={LOSS_SSIM_IR_RATIO})")
-        print(f"  color={LOSS_COLOR_RATIO}, grad={LOSS_GRAD_RATIO}")
+        print("扩散状态:   带噪 VI latent，训练和推理相同")
+        print(f"推理起点:   strength={args.denoise_strength}")
+        print("条件:       红外 ControlNet，光流对齐残差")
+        print("预测:       融合 latent z_F")
+        print("冻结:       VAE / RAFT。UNet 与红外 ControlNet 全量训练")
+        print(f"GT fusion:  {args.gt_data_dir}")
+        print("后处理:     这一阶段不使用 TemporalRestormer")
+        print("Loss配置:")
+        print("  L = ||z_hat - z_F||^2")
         print("=" * 60)
 
     global_step = args.start_step
@@ -719,16 +811,18 @@ def main(args):
     )
 
     epoch = 0
+    num_train_timesteps = int(model.train_scheduler.config.num_train_timesteps)
+    accum_models = (model.unet, model.video_controlnet)
     while global_step < args.max_train_steps:
-        model.eval_mode()
-        sr_adapter.train()
+        model.train_mode()
         for batch in dataloader:
             if global_step >= args.max_train_steps:
                 break
 
-            with accelerator.accumulate(sr_adapter):
+            with accelerator.accumulate(*accum_models):
                 vi = batch['vi_video'].to(accelerator.device, dtype=torch.float32)
                 ir = batch['ir_video'].to(accelerator.device, dtype=torch.float32)
+                gt = batch['gt_video'].to(accelerator.device, dtype=torch.float32)
                 B = vi.shape[0]
 
                 anchor_tensor = batch.get('ir_anchor_idx', None)
@@ -738,47 +832,26 @@ def main(args):
                 with torch.no_grad():
                     vi_latent = model.vae_encode(vi.permute(0, 2, 1, 3, 4)).float()
                     ir_latent = model.vae_encode(ir.permute(0, 2, 1, 3, 4)).float()
-                    noise_scheduler.set_timesteps(1, time_shift=3.0, device=accelerator.device)
-                    t_step = noise_scheduler.timesteps[0]
-                    t = t_step.unsqueeze(0).repeat(B).to(accelerator.device)
-                    x_t = vi_latent.clone()
+                    fusion_latent = model.vae_encode(gt.permute(0, 2, 1, 3, 4)).float()
 
-                    # 开启光流 warp：传入 VI 像素帧用于估计帧间光流。
-                    vi_frames = vi.permute(0, 2, 1, 3, 4).contiguous() \
-                        if model.ir_flow_prop is not None else None
+                vi_frames = vi.permute(0, 2, 1, 3, 4).contiguous() \
+                    if model.ir_flow_prop is not None else None
 
-                    pred_velocity = model.forward(
-                        x_t=x_t, t=t, ir_latent=ir_latent,
+                timesteps = torch.randint(
+                    0, num_train_timesteps, (B,),
+                    device=accelerator.device, dtype=torch.long,
+                )
+                noise = torch.randn_like(vi_latent)
+                x_t = model.train_scheduler.add_noise(vi_latent, noise, timesteps)
+
+                with accelerator.autocast():
+                    z_pred = model.forward_diffusion(
+                        x_t, timesteps, vi_latent, ir_latent,
                         vi_frames=vi_frames,
                         ir_anchor_idx=sample_anchor,
                     ).float()
-                    dt = noise_scheduler.sigmas[1] - noise_scheduler.sigmas[0]
-                    pred_latent = x_t.to(torch.float32) + pred_velocity.to(torch.float32) * dt
-
-                # 统一重建尾部：VAE 解码(冻结, no_grad) + TemporalRestormer 增强(可训练)
-                pred_sr_video = decode_and_enhance(
-                    model, sr_adapter, pred_latent, args.num_frames
-                )
-                pred_img = rearrange(pred_sr_video, "b c t h w -> (b t) c h w")
-
-                vi_01 = _to_01(vi)
-                ir_01 = _to_01(ir)
-                vi_img = rearrange(vi_01, "b c t h w -> (b t) c h w")
-                ir_img = rearrange(ir_01, "b c t h w -> (b t) c h w")
-                if SR_UPSCALE != 1:
-                    target_size = pred_img.shape[-2:]
-                    vi_img = F.interpolate(vi_img, size=target_size, mode="bilinear", align_corners=False)
-                    ir_img = F.interpolate(ir_img, size=target_size, mode="bilinear", align_corners=False)
-
-                loss, loss_ssim, loss_max, loss_color, loss_grad = fusion_unsupervised_loss(
-                    vi_img, ir_img, pred_img,
-                    max_ratio=LOSS_MAX_RATIO,
-                    ssim_vis_ratio=LOSS_SSIM_VIS_RATIO,
-                    ssim_ir_ratio=LOSS_SSIM_IR_RATIO,
-                    ssim_ratio=LOSS_SSIM_RATIO,
-                    color_ratio=LOSS_COLOR_RATIO,
-                    grad_ratio=LOSS_GRAD_RATIO,
-                )
+                loss_z = F.mse_loss(z_pred, fusion_latent)
+                loss = loss_z
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     optimizer.zero_grad()
@@ -797,30 +870,36 @@ def main(args):
 
                 accelerator.log({
                     "loss": loss.item(),
-                    "loss_ssim": loss_ssim.item(),
-                    "loss_max": loss_max.item(),
-                    "loss_color": loss_color.item(),
-                    "loss_grad": loss_grad.item(),
+                    "loss_z": loss_z.item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "epoch": epoch,
                 }, step=global_step)
                 progress_bar.set_postfix(
                     loss=f"{loss.item():.4f}",
-                    ssim=f"{loss_ssim.item():.4f}",
-                    max=f"{loss_max.item():.4f}",
-                    color=f"{loss_color.item():.4f}",
-                    grad=f"{loss_grad.item():.4f}",
+                    z=f"{loss_z.item():.4f}",
                 )
 
                 if global_step % args.validation_steps == 0 and accelerator.is_main_process:
                     try:
+                        model.eval_mode()
+                        with torch.no_grad():
+                            gen_latent = model.sample_diffusion(
+                                vi_latent, ir_latent,
+                                num_steps=args.num_inference_steps,
+                                vi_frames=vi_frames,
+                                ir_anchor_idx=sample_anchor,
+                                strength=args.denoise_strength,
+                            )
+                            vis_video = decode_video(model, gen_latent, args.num_frames)
+                        model.train_mode()
                         save_validation_triplet(
-                            vi.detach(), ir.detach(), pred_sr_video.detach(),
+                            vi.detach(), ir.detach(), vis_video.detach(),
                             os.path.join(args.output_dir, "validations"), global_step,
                         )
                     except Exception:
                         import traceback
                         traceback.print_exc()
+                        model.train_mode()
 
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")

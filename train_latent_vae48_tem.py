@@ -72,8 +72,9 @@ def replace_vae_to_4x(model, vae_ckpt_path):
     vae_4x.eval()
     vae_4x.requires_grad_(False)
     vae_4x.to(model.device, dtype=torch.float32)
-    del model.vae
-    torch.cuda.empty_cache()
+    if getattr(model, "vae", None) is not None:
+        del model.vae
+        torch.cuda.empty_cache()
     model.vae = vae_4x
 
     def vae_encode_4x(self, video, chunk_size=1):

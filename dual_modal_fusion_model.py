@@ -34,29 +34,33 @@ from diffusers import AutoencoderKLTemporalDecoder
 
 # 导入STAR的模块
 import sys
-base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(base_path)
+this_dir = os.path.dirname(os.path.abspath(__file__))
+base_path = os.path.abspath(os.path.join(this_dir, '..'))
+if base_path not in sys.path:
+    sys.path.insert(0, base_path)
+if this_dir not in sys.path:
+    sys.path.insert(0, this_dir)
 
 from video_to_video.modules.unet_v2v import VideoControlNet, Vid2VidSDUNet
 from video_to_video.modules.unet_v2v import sinusoidal_embedding, USE_TEMPORAL_TRANSFORMER
 from video_to_video.modules.unet_v2v import TemporalTransformer
 
 try:
-    from Fusion_SGFE.unet_SGFE import SGFEVid2VidSDUNet
-except ImportError:
     from unet_SGFE import SGFEVid2VidSDUNet
+except ImportError:
+    from Fusion_SGFE.unet_SGFE import SGFEVid2VidSDUNet
 from video_to_video.utils.config import cfg
 from video_to_video.utils.logger import get_logger
 
 try:
-    from .flow_match import FlowMatchDiscreteScheduler
+    from flow_match import FlowMatchDiscreteScheduler
 except ImportError:
     from Fusion.flow_match import FlowMatchDiscreteScheduler
 
 try:
-    from Fusion_SGFE.ir_flow_propagation import IRFlowPropagation
-except ImportError:
     from ir_flow_propagation import IRFlowPropagation
+except ImportError:
+    from Fusion_SGFE.ir_flow_propagation import IRFlowPropagation
 
 logger = get_logger()
 
@@ -82,9 +86,12 @@ class VideoControlNetModel:
         self.device = device
         self.use_hfp = use_hfp
         
-        # ============ VideoControlNet ============
+        # ============ 双条件分支 ============
+        # video_controlnet: IR 条件。controlnet_vi: VI 条件。
+        # 两者结构相同，残差相加后注入主 UNet。
         self.video_controlnet = VideoControlNet().to(self.device)
-        logger.info('Built VideoControlNet')
+        self.controlnet_vi = VideoControlNet().to(self.device)
+        logger.info('Built IR ControlNet and VI ControlNet')
         
         # ============ Vid2VidSDUNet (或 SGFEVid2VidSDUNet) ============
         if use_hfp:
@@ -126,30 +133,45 @@ class VideoControlNetModel:
             device=self.device
         )
         logger.info('Built Flow Matching Scheduler (VI → Fusion)')
+
+        # 扩散状态是带噪的可见光 latent。网络直接预测融合 latent x0。
+        from diffusers import DDPMScheduler, DDIMScheduler
+        self.train_scheduler = DDPMScheduler(
+            num_train_timesteps=1000,
+            beta_schedule="scaled_linear",
+            prediction_type="sample",
+            clip_sample=False,
+        )
+        self.infer_scheduler = DDIMScheduler.from_config(self.train_scheduler.config)
+        logger.info('Built DDPM/DDIM schedulers (noise on VI latent, predict fusion x0)')
         
         # ============ Temporal VAE ============
+        # vae_path 为 None 时不加载。当前训练会立刻换成 4x VAE，用不到这个权重。
         vae_path = getattr(opt, 'vae_path', "stabilityai/stable-video-diffusion-img2vid")
-        
-        if os.path.exists(vae_path):
-            logger.info(f'Loading VAE from local path: {vae_path}')
-            vae = AutoencoderKLTemporalDecoder.from_pretrained(
-                vae_path,
-                torch_dtype=torch.float16
-            )
+        if not vae_path:
+            self.vae = None
+            logger.info('Skipped temporal VAE')
         else:
-            logger.info(f'Loading VAE from Hugging Face: {vae_path}')
-            vae = AutoencoderKLTemporalDecoder.from_pretrained(
-                vae_path,
-                subfolder="vae",
-                variant="fp16",
-                torch_dtype=torch.float16
-            )
-        
-        vae.eval()
-        vae.requires_grad_(False)
-        vae.to(self.device, dtype=torch.float16)
-        self.vae = vae
-        logger.info('Built Temporal VAE')
+            if os.path.exists(vae_path):
+                logger.info(f'Loading VAE from local path: {vae_path}')
+                vae = AutoencoderKLTemporalDecoder.from_pretrained(
+                    vae_path,
+                    torch_dtype=torch.float16
+                )
+            else:
+                logger.info(f'Loading VAE from Hugging Face: {vae_path}')
+                vae = AutoencoderKLTemporalDecoder.from_pretrained(
+                    vae_path,
+                    subfolder="vae",
+                    variant="fp16",
+                    torch_dtype=torch.float16
+                )
+
+            vae.eval()
+            vae.requires_grad_(False)
+            vae.to(self.device, dtype=torch.float16)
+            self.vae = vae
+            logger.info('Built Temporal VAE')
 
         # ============ IR 光流传播模块 (可选) ============
         self.ir_flow_prop = None
@@ -196,8 +218,11 @@ class VideoControlNetModel:
             
             ret1 = self.video_controlnet.load_state_dict(ctrl_dict, strict=False)
             ret2 = self.unet.load_state_dict(unet_dict, strict=False)
+            if hasattr(self, "controlnet_vi"):
+                ret3 = self.controlnet_vi.load_state_dict(ctrl_dict, strict=False)
+                logger.info(f'Loaded VI ControlNet from the same checkpoint: missing={len(ret3.missing_keys)}')
             
-            logger.info(f'Loaded VideoControlNet: missing={len(ret1.missing_keys)}')
+            logger.info(f'Loaded IR ControlNet: missing={len(ret1.missing_keys)}')
             logger.info(f'Loaded UNet: missing={len(ret2.missing_keys)}')
         except Exception as e:
             logger.error(f"Failed to load pretrained weights: {e}")
@@ -220,8 +245,9 @@ class VideoControlNetModel:
         """
         if train_hfp_only and self.use_hfp:
             # ── 仅 HFP 训练模式 ──────────────────────────────────────────
-            for param in self.video_controlnet.parameters():
-                param.requires_grad = False
+            for ctrl in self._controlnets():
+                for param in ctrl.parameters():
+                    param.requires_grad = False
             for param in self.unet.parameters():
                 param.requires_grad = False
             for param in self.unet.hfp_modules.parameters():
@@ -233,10 +259,11 @@ class VideoControlNetModel:
             print(f"     (梯度可回传过冻结层, 但冻结参数不更新)")
         else:
             # ── 常规冻结策略 ─────────────────────────────────────────────
-            for param in self.video_controlnet.parameters():
-                param.requires_grad = train_controlnet
+            for ctrl in self._controlnets():
+                for param in ctrl.parameters():
+                    param.requires_grad = train_controlnet
             status_ctrl = "可训练" if train_controlnet else "冻结"
-            print(f"VideoControlNet: {status_ctrl}")
+            print(f"ControlNet-IR / ControlNet-VI: {status_ctrl}")
 
             for param in self.unet.parameters():
                 param.requires_grad = train_unet
@@ -267,12 +294,19 @@ class VideoControlNetModel:
         # VAE 始终冻结
         print("VAE: 冻结")
     
+    def _controlnets(self):
+        nets = [self.video_controlnet]
+        if getattr(self, "controlnet_vi", None) is not None:
+            nets.append(self.controlnet_vi)
+        return nets
+
     def get_trainable_parameters(self):
-        """返回所有可训练参数 (ControlNet + UNet，含 HFP)"""
+        """返回所有可训练参数 (两路 ControlNet + UNet，含 HFP)"""
         params = []
-        for param in self.video_controlnet.parameters():
-            if param.requires_grad:
-                params.append(param)
+        for ctrl in self._controlnets():
+            for param in ctrl.parameters():
+                if param.requires_grad:
+                    params.append(param)
         for param in self.unet.parameters():
             if param.requires_grad:
                 params.append(param)
@@ -297,9 +331,10 @@ class VideoControlNetModel:
         """返回 UNet + ControlNet 中除时序模块外的可训练参数"""
         temporal_ids = {id(p) for p in self.get_temporal_parameters()}
         params = []
-        for p in self.video_controlnet.parameters():
-            if p.requires_grad and id(p) not in temporal_ids:
-                params.append(p)
+        for ctrl in self._controlnets():
+            for p in ctrl.parameters():
+                if p.requires_grad and id(p) not in temporal_ids:
+                    params.append(p)
         for p in self.unet.parameters():
             if p.requires_grad and id(p) not in temporal_ids:
                 params.append(p)
@@ -317,23 +352,25 @@ class VideoControlNetModel:
         HFP 模块保持 fp32：DCT/FFT 在 fp16 下极易溢出（fp16 最大值仅 65504），
         HFP 的计算路径包含大量累加操作，必须用 fp32 保证数值稳定。
         """
-        self.video_controlnet.half()
+        for ctrl in self._controlnets():
+            ctrl.half()
         self.unet.half()
         if self.use_hfp:
             self.unet.hfp_modules.float()  # HFP 恢复 fp32
     
     def eval_mode(self):
         """评估模式"""
-        self.video_controlnet.eval()
+        for ctrl in self._controlnets():
+            ctrl.eval()
         self.unet.eval()
     
     def train_mode(self):
         """训练模式"""
-        has_trainable_ctrl = any(p.requires_grad for p in self.video_controlnet.parameters())
-        if has_trainable_ctrl:
-            self.video_controlnet.train()
-        else:
-            self.video_controlnet.eval()
+        for ctrl in self._controlnets():
+            if any(p.requires_grad for p in ctrl.parameters()):
+                ctrl.train()
+            else:
+                ctrl.eval()
         
         has_trainable_unet = any(p.requires_grad for p in self.unet.parameters())
         if has_trainable_unet:
@@ -616,6 +653,115 @@ class VideoControlNetModel:
             return x, block_features
         return x
     
+    def forward_diffusion(self, x_t, t, vi_latent, ir_latent,
+                          vi_frames=None, _precomputed_flows=None,
+                          ir_anchor_idx: int = 0):
+        """从带噪可见光状态预测融合 latent。
+
+        x_t       : sqrt(ᾱ_t) z_VI + sqrt(1-ᾱ_t) ε，主 UNet 输入
+        t         : (B,) 整数扩散步
+        vi_latent : 保留接口。可见光已经在 x_t 里，不再走第二条 ControlNet
+        ir_latent : 红外条件。ControlNet 之后用光流把残差对齐到各 VI 帧
+        返回预测的融合 latent，形状与 x_t 相同。
+        """
+        del vi_latent
+        batch, _, f, _, _ = x_t.shape
+        t = t.to(device=x_t.device).float()
+        # ControlNet 直接用整数步做时间嵌入。
+        # 主 UNet 这条路径内部会再乘 1000，所以这里先除回去，两边看到的是同一步。
+        t_unet = t / float(self.train_scheduler.config.num_train_timesteps)
+
+        ctrl_ir = self.video_controlnet(x_t, t, None, hint=ir_latent)
+
+        if self.ir_flow_prop is not None and vi_frames is not None:
+            with torch.no_grad():
+                flows_fwd, flows_bwd = self._resolve_flows(
+                    vi_frames, _precomputed_flows, need_bwd=(ir_anchor_idx > 0)
+                )
+            h_pix, w_pix = vi_frames.shape[3], vi_frames.shape[4]
+            ctrl_ir = self.ir_flow_prop.warp_ctrl_signals(
+                ctrl_ir, flows_fwd, h_pix, w_pix, f,
+                anchor_idx=int(ir_anchor_idx),
+                flows_bwd=flows_bwd,
+            )
+
+        return self._forward_unet(x_t, t_unet, None, ctrl_ir, f)
+
+    def _alpha_bar(self, timestep, ref):
+        alphas = self.train_scheduler.alphas_cumprod.to(device=ref.device, dtype=torch.float32)
+        index = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
+        alpha = alphas[index]
+        while alpha.ndim < ref.ndim:
+            alpha = alpha.unsqueeze(-1)
+        return alpha
+
+    def ddim_step_from_x0(self, x_t, t, t_prev, z0_pred):
+        """用预测的融合 latent 做确定性 DDIM，不把网络输出当作噪声。
+
+        ε̂ = (x_t - sqrt(ᾱ_t) ẑ_F) / sqrt(1-ᾱ_t)
+        x_{t-1} = sqrt(ᾱ_{t-1}) ẑ_F + sqrt(1-ᾱ_{t-1}) ε̂
+
+        时间表走完后，上一步用 ᾱ_0，不把 ᾱ 设成 1。
+        """
+        z0_pred = z0_pred.float()
+        x_t = x_t.float()
+        alpha_t = self._alpha_bar(t, x_t)
+        alpha_prev = self._alpha_bar(0 if t_prev is None else t_prev, x_t)
+        eps_pred = (x_t - alpha_t.sqrt() * z0_pred) / (1.0 - alpha_t).sqrt().clamp(min=1e-8)
+        return alpha_prev.sqrt() * z0_pred + (1.0 - alpha_prev).sqrt() * eps_pred
+
+    def predict_x0(self, x_t, t, eps):
+        """从噪声预测还原 z0。t 是整数扩散步。"""
+        alpha = self.train_scheduler.alphas_cumprod.to(device=x_t.device, dtype=torch.float32)[t.long()]
+        while alpha.ndim < x_t.ndim:
+            alpha = alpha.unsqueeze(-1)
+        eps = eps.float()
+        x_t = x_t.float()
+        return (x_t - (1.0 - alpha).sqrt() * eps) / alpha.sqrt().clamp(min=1e-8)
+
+    @torch.no_grad()
+    def sample_diffusion(self, vi_latent, ir_latent, num_steps=20,
+                         vi_frames=None, ir_anchor_idx: int = 0,
+                         strength: float = 1.0):
+        """从带噪的可见光 latent 做 DDIM。网络每步预测融合 latent x0。
+
+        初始化和训练用同一个前向过程：x = sqrt(ᾱ) z_VI + sqrt(1-ᾱ) ε。
+        strength=1 从推理表上最吵的一步开始。
+        """
+        batch = vi_latent.shape[0]
+        device = vi_latent.device
+        scheduler = self.infer_scheduler
+        scheduler.set_timesteps(num_steps, device=device)
+        strength = float(min(max(strength, 1e-3), 1.0))
+        init_timestep = max(1, min(int(num_steps * strength), num_steps))
+        t_start = max(num_steps - init_timestep, 0)
+        timesteps = scheduler.timesteps[t_start:]
+
+        precomputed_flows = None
+        if self.ir_flow_prop is not None and vi_frames is not None:
+            if ir_anchor_idx > 0:
+                precomputed_flows = self.ir_flow_prop.estimate_bidirectional_flows(vi_frames)
+            else:
+                precomputed_flows = self.ir_flow_prop.estimate_flow(vi_frames)
+
+        t0 = timesteps[0]
+        t0_value = int(t0.item()) if torch.is_tensor(t0) else int(t0)
+        t0_batch = torch.full((batch,), t0_value, device=device, dtype=torch.long)
+        noise = torch.randn_like(vi_latent)
+        x = self.train_scheduler.add_noise(vi_latent.float(), noise.float(), t0_batch)
+        timestep_list = [int(t.item()) if torch.is_tensor(t) else int(t) for t in timesteps]
+        for index, t_value in enumerate(timestep_list):
+            t_prev = timestep_list[index + 1] if index + 1 < len(timestep_list) else None
+            t_batch = torch.full((batch,), t_value, device=device, dtype=torch.long)
+            z0_pred = self.forward_diffusion(
+                x, t_batch, vi_latent, ir_latent,
+                vi_frames=vi_frames,
+                _precomputed_flows=precomputed_flows,
+                ir_anchor_idx=int(ir_anchor_idx),
+            )
+            x = self.ddim_step_from_x0(x, t_value, t_prev, z0_pred)
+        return x
+
     # ============ Flow Matching 采样 (从 VI 开始) ============
     
     @torch.no_grad()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-推理脚本 — Fusion_SGFE 单步扩散（启用 SGFE block3）
+推理脚本 — 条件潜空间扩散（从纯噪声做 DDIM，启用 SGFE block3）
 
 输入: 512×512
 输出: E:\paper2\ablation_result\none\<子文件夹>\gray|color
@@ -60,8 +60,10 @@ def parse_args():
 
     # ── 推理设置 ──
     parser.add_argument("--video_size", type=int, nargs=2, default=[512, 512])
-    parser.add_argument("--num_inference_steps", type=int, default=1,
-                        help="扩散步数（单步脚本默认=1，实际仅执行一步）")
+    parser.add_argument("--num_inference_steps", type=int, default=20,
+                        help="DDIM 去噪步数")
+    parser.add_argument("--denoise_strength", type=float, default=1.0,
+                        help="从带噪可见光 latent 开始。1 为最吵的一步，和训练一致")
     parser.add_argument("--time_shift", type=float, default=3.0)
     parser.add_argument("--vi_per_ir", type=int, default=8,
                         help="仅作同名缺失时的回退比例索引；默认优先按窗口第一帧同名配对")
@@ -144,7 +146,9 @@ def select_ir_index_for_window(
 
 
 @torch.no_grad()
-def run_inference(model, vi_video, ir_video, num_steps=1, time_shift=13.0, sr_module=None):
+def run_inference(model, vi_video, ir_video, num_steps=20, time_shift=13.0, sr_module=None,
+                  ir_anchor_idx=0, strength=0.8):
+    del time_shift
     model.eval_mode()
     B, C, T, H, W = vi_video.shape
     device = next(model.unet.parameters()).device
@@ -154,27 +158,17 @@ def run_inference(model, vi_video, ir_video, num_steps=1, time_shift=13.0, sr_mo
     ir_video_perm = ir_video_device.permute(0, 2, 1, 3, 4)
     vi_latent = model.vae_encode(vi_video_perm)
     ir_latent = model.vae_encode(ir_video_perm)
-    # 开启 IR 光流 warp：传入 VI 像素帧并预计算光流供采样循环复用
     vi_frames = vi_video_perm.float() if model.ir_flow_prop is not None else None
-    precomputed_flows = None
-    if model.ir_flow_prop is not None and vi_frames is not None:
-        precomputed_flows = model.ir_flow_prop.estimate_flow(vi_frames)
-    # 单步扩散：只做一次速度预测 + 一次 scheduler 更新。
-    steps = max(1, int(num_steps))
-    model.noise_scheduler.set_timesteps(steps, time_shift=time_shift, device=device)
-    x_t = vi_latent.clone()
-    t_step = model.noise_scheduler.timesteps[0]
-    t_batch = t_step.unsqueeze(0).repeat(B).to(device)
-    v_pred = model.forward(
-        x_t=x_t, t=t_batch, ir_latent=ir_latent,
-        vi_frames=vi_frames, _precomputed_flows=precomputed_flows
+    # 从纯噪声做 DDIM。VI / IR 只作为条件。
+    x_next = model.sample_diffusion(
+        vi_latent, ir_latent,
+        num_steps=max(1, int(num_steps)),
+        vi_frames=vi_frames,
+        ir_anchor_idx=int(ir_anchor_idx),
+        strength=float(strength),
     )
-    # 显式单步积分：x_{t+1} = x_t + v * Δt
-    # 与 scheduler.step 等价，但这里直接写出，便于与“单次速度预测”假设对齐。
-    dt = model.noise_scheduler.sigmas[1] - model.noise_scheduler.sigmas[0]
-    x_next = x_t.to(torch.float32) + v_pred.to(torch.float32) * dt
     if sr_module is not None:
-        # 与训练一致的重建尾部：VAE 解码 + TemporalRestormer 增强
+        # 可选后处理。扩散采样本身已经结束，不再做单步积分。
         pred_video = decode_and_enhance(model, sr_module, x_next, T)
     else:
         pred_video = model.vae_decode_chunk(x_next, chunk_size=T)
@@ -205,7 +199,7 @@ TAIL_FRAMES = 60
 def main():
     args = parse_args()
     print("=" * 70)
-    print("推理: Fusion_SGFE 单步扩散（启用 SGFE，启用 IR 光流 warp）")
+    print("推理: 从带噪可见光 latent 做 DDIM（启用 SGFE，启用 IR 光流 warp）")
     print("=" * 70)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -364,9 +358,12 @@ def main():
                 ir_frame_files, ir_idx, NUM_FRAMES, video_size, interp=in_interp)
             ir_video = ir_video.unsqueeze(0)
 
+            ir_anchor = 0 if args.ir_select_mode == "first" else (NUM_FRAMES - 1) // 2
             pred_video = run_inference(model, vi_video, ir_video,
                                        args.num_inference_steps, args.time_shift,
-                                       sr_module=sr_module)
+                                       sr_module=sr_module,
+                                       ir_anchor_idx=ir_anchor,
+                                       strength=args.denoise_strength)
 
             for pos, f_idx in enumerate(win):
                 pred_frame = pred_video[0, :, pos].float().cpu().numpy()
